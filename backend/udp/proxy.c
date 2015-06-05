@@ -28,6 +28,8 @@
 #include <linux/icmp.h>
 #include <fcntl.h>
 
+#include <sys/socket.h>
+
 #define CMD_DEFINE
 #include "proxy.h"
 
@@ -39,6 +41,11 @@ struct ip_net {
 struct route_entry {
 	struct ip_net      dst;
 	struct sockaddr_in next_hop;
+};
+
+struct peer_entry {
+        struct ip_net      dst;
+       struct sockaddr_in next_hop;
 };
 
 typedef struct icmp_pkt {
@@ -56,7 +63,16 @@ struct route_entry *routes;
 size_t routes_alloc;
 size_t routes_cnt;
 
+struct peer_entry *peers;
+size_t peers_alloc;
+size_t peers_cnt;
+
 in_addr_t tun_addr;
+
+struct sockaddr_in pub_addr = {
+       .sin_family = AF_INET
+};
+
 
 int log_enabled;
 int exit_flag;
@@ -160,6 +176,12 @@ static void send_net_unreachable(int tun, char *offender) {
 	}
 }
 
+int compare_saddr(const struct sockaddr_in *sa1, const struct sockaddr_in *sa2) {
+       return(memcmp( &(sa1)->sin_addr,
+                       &(sa2)->sin_addr,
+                       sizeof(struct in_addr)));
+}
+
 static int set_route(struct ip_net dst, struct sockaddr_in *next_hop) {
 	size_t i;
 
@@ -175,14 +197,46 @@ static int set_route(struct ip_net dst, struct sockaddr_in *next_hop) {
 		struct route_entry *new_routes = (struct route_entry *) realloc(routes, new_alloc*sizeof(struct route_entry));
 		if( !new_routes )
 			return ENOMEM;
-
 		routes = new_routes;
 		routes_alloc = new_alloc;
 	}
 
-	routes[routes_cnt].dst = dst;
-	routes[routes_cnt].next_hop = *next_hop;
-	routes_cnt++;
+       routes[routes_cnt].dst = dst;
+       routes[routes_cnt].next_hop = *next_hop;
+       routes_cnt++;
+
+       if ( compare_saddr( next_hop, &pub_addr ) == 0 ) {
+               log_error("this is local subnet, skipping ...\n");
+               return 0;
+       }
+
+        for( i = 0; i < peers_cnt; i++ ) {
+                if( dst.ip == peers[i].dst.ip && dst.mask == peers[i].dst.mask ) {
+                       log_error("network already exists in peers, checking next hop now");
+                       if ( compare_saddr( next_hop, &peers[i].next_hop ) == 0 ) {
+                               log_error("the next hop is the same");
+                       } else {
+                               peers[i].next_hop = *next_hop;
+                       }
+                        return 0;
+                }
+        }
+
+	if ( peers_alloc == peers_cnt ) {
+		int new_peer_alloc = (peers_alloc ? 2*peers_alloc : 8);
+               struct peer_entry *new_peers = (struct peer_entry *) realloc(peers, new_peer_alloc*sizeof(struct peer_entry));
+                if ( !new_peers )
+			return ENOMEM;
+		peers = new_peers;
+		peers_alloc = new_peer_alloc;
+	}
+
+       // log_error("adding remote peer with IP address %s\n", inet_ntoa(next_hop->sin_addr));
+       peers[peers_cnt].dst = dst;
+       peers[peers_cnt].next_hop = *next_hop;
+       log_error("added remote peer ", inet_ntoa( *(struct in_addr *) &pub_addr ));
+       log_error("with IP address %s\n",inet_ntoa( peers[peers_cnt].next_hop.sin_addr ));
+       peers_cnt++;
 
 	return 0;
 }
@@ -246,8 +300,13 @@ static ssize_t tun_recv_packet(int tun, char *buf, size_t buflen) {
 	return nread;
 }
 
-static ssize_t sock_recv_packet(int sock, char *buf, size_t buflen) {
-	ssize_t nread = recv(sock, buf, buflen, MSG_DONTWAIT);
+static ssize_t sock_recv_packet(int sock, char *buf, size_t buflen, struct sockaddr_in *orig_src) {
+
+       struct sockaddr_storage peer_addr;
+       socklen_t peer_addr_len;
+       peer_addr_len = sizeof(peer_addr);
+       memset(&peer_addr, 0, sizeof(struct sockaddr_storage));
+       ssize_t nread = recvfrom(sock, buf, buflen, MSG_DONTWAIT, (struct sockaddr *) &peer_addr, &peer_addr_len);
 
 	if( nread < sizeof(struct iphdr) ) {
 		if( nread < 0 ) {
@@ -259,6 +318,7 @@ static ssize_t sock_recv_packet(int sock, char *buf, size_t buflen) {
 		return -1;
 	}
 
+       memcpy(orig_src, &peer_addr, sizeof(struct sockaddr_in));
 	return nread;
 }
 
@@ -314,49 +374,130 @@ inline static int decrement_ttl(struct iphdr *iph) {
 
 static int tun_to_udp(int tun, int sock, char *buf, size_t buflen) {
 	struct iphdr *iph;
+        char saddr[32], daddr[32];
 	struct sockaddr_in *next_hop;
-
+	size_t i;
 	ssize_t pktlen = tun_recv_packet(tun, buf, buflen);
 	if( pktlen < 0 )
 		return 0;
-	
+
 	iph = (struct iphdr *)buf;
 
-	next_hop = find_route((in_addr_t) iph->daddr);
-	if( !next_hop ) {
+       if ( ( iph->protocol == 103 && ( ntohl(iph->daddr) & 0xf0000000) == 0xe0000000 ) || iph->protocol == 2 ) {
+                iph->ttl++;
+		for (i = 0; i < peers_cnt; i++)  {
+                        sock_send_packet(sock, buf, pktlen, &peers[i].next_hop);
+                        log_error("sent ");
+                        if (iph->protocol == 103) {
+                                log_error("PIM ");
+                        } else {
+                                log_error("IGMP ");
+                        }
+                        log_error("packet (len=%u) from %s ", pktlen,
+                                inaddr_str(iph->saddr, saddr, sizeof(saddr)));
+                        log_error("to %s ", inaddr_str(iph->daddr, daddr, sizeof(daddr)));
+                        log_error("via %s\n", inet_ntoa( peers[i].next_hop.sin_addr ));
+		}
+        } else if ( ( ntohl(iph->daddr) & 0xf0000000) == 0xe0000000 ) {
+		log_error("detected multicast packet destined for %s, dropping ...\n",
+				inet_ntoa(*(struct in_addr *)&iph->daddr));
 		send_net_unreachable(tun, buf);
-		goto _active;
-	}
+                goto _active;
+        } else {
+                /* log_error("%s is not a multicast destination\n",
+                                inet_ntoa(*(struct in_addr *)&iph->daddr)); */
 
-	if( !decrement_ttl(iph) ) {
-		/* TTL went to 0, discard.
-		 * TODO: send back ICMP Time Exceeded
-		 */
-		goto _active;
-	}
+		next_hop = find_route((in_addr_t) iph->daddr);
+		if( !next_hop ) {
+			log_error("No next hop for %s\n", inet_ntoa(*(struct in_addr *)&iph->daddr));
+			send_net_unreachable(tun, buf);
+			goto _active;
+		}
 
-	sock_send_packet(sock, buf, pktlen, next_hop);
+		if( !decrement_ttl(iph) ) {
+                       /* TTL went to 0, discard.
+                        * TODO: send back ICMP Time Exceeded
+                        */
+			goto _active;
+		}
+		sock_send_packet(sock, buf, pktlen, next_hop);
+
+                if (iph->protocol == 103) {
+                        log_error("sent non-multicast PIM packet (len=%u) from %s ", pktlen, inaddr_str(iph->saddr, saddr, sizeof(saddr)));
+                        log_error("to %s ", inaddr_str(iph->daddr, daddr, sizeof(daddr)));
+                        log_error("via %s\n", inet_ntoa( next_hop->sin_addr ));
+                }
+	}
 _active:
 	return 1;
 }
 
 static int udp_to_tun(int sock, int tun, char *buf, size_t buflen) {
 	struct iphdr *iph;
-
-	ssize_t pktlen = sock_recv_packet(sock, buf, buflen);
+        struct sockaddr_in orig_src;
+        char saddr[32], daddr[32];
+        ssize_t pktlen = sock_recv_packet(sock, buf, buflen, &orig_src);
 	if( pktlen < 0 )
 		return 0;
 
 	iph = (struct iphdr *)buf;
 
-	if( !decrement_ttl(iph) ) {
-		/* TTL went to 0, discard.
-		 * TODO: send back ICMP Time Exceeded
-		 */
-		goto _active;
-	}
+        if( !decrement_ttl(iph) ) {
+                goto _active;
+        }
 
-	tun_send_packet(tun, buf, pktlen);
+        if ( ( ntohl(iph->daddr) & 0xffffff00 ) == 0xe0000000 ) {
+                int pimd_socket;
+                log_error("received packet (%u) for %s ", pktlen,
+                        inaddr_str(iph->daddr, daddr, sizeof(daddr)));
+                log_error("from %s ", inaddr_str(iph->saddr, saddr, sizeof(saddr)));
+                log_error("via %s ", inet_ntoa(orig_src.sin_addr));
+                /* if ( ( ntohl(iph->daddr) & 0xe000000d ) == 0xe000000d ) {
+                        log_error("[ALL_PIM_ROUTERS] ");
+                        pimd_socket = socket(AF_INET, SOCK_RAW, IPPROTO_PIM);
+                } else if ( ( ntohl(iph->daddr) & 0xe0000002 ) == 0xe0000002 ) {
+                        log_error("[ALL_ROUTERS] ");
+                        pimd_socket = socket(AF_INET, SOCK_RAW, IPPROTO_PIM);
+                } else if  ( ( ntohl(iph->daddr) & 0xe0000001 ) == 0xe0000001 ) {
+                        log_error("[ALL_HOSTS] ");
+                        pimd_socket = socket(AF_INET, SOCK_RAW, IPPROTO_PIM);
+                */
+                if (iph->protocol == 103) {
+                        log_error("[PIM] ");
+                        pimd_socket = socket(AF_INET, SOCK_RAW, IPPROTO_PIM);
+                } else if (iph->protocol == 2) {
+                        log_error("[IGMP] ");
+                        pimd_socket = socket(AF_INET, SOCK_RAW, IPPROTO_IGMP);
+                } else {
+                        log_error("[LOCAL_CTRL: %s] dropping ...\n", inaddr_str(iph->daddr, daddr, sizeof(daddr)));
+                        return 0;
+                }
+                log_error("\n");
+                if (pimd_socket < 0) {
+                        log_error("failed (errno %d) to create pimd socket\n", errno);
+                        return 0;
+                }
+                struct sockaddr_in sin;
+                memset(&sin, 0, sizeof(sin));
+                sin.sin_family = AF_INET;
+                sin.sin_addr.s_addr = iph->saddr;
+                //log_error("message send to pimd as it was sent by %s ", inet_ntoa(sin.sin_addr));
+                //log_error("prot = %d\n", iph->protocol);
+                size_t iph_len, pimd_len;
+                iph_len = iph->ihl << 2;
+                pimd_len = pktlen - iph_len;
+                //log_error("msglen = %u\n", pimd_len);
+                if (sendto(pimd_socket, &buf[iph_len], pimd_len, 0, (struct sockaddr *)&sin, sizeof(sin)) < 0) {
+                        log_error("failed (errno %d) to send data over pimd socket\n", errno);
+                }
+
+                close(pimd_socket);
+
+                return 0;
+
+        }
+
+        tun_send_packet(tun, buf, pktlen);
 _active:
 	return 1;
 }
@@ -401,7 +542,7 @@ enum PFD {
 	PFD_CNT
 };
 
-void run_proxy(int tun, int sock, int ctl, in_addr_t tun_ip, size_t tun_mtu, int log_errors) {
+void run_proxy(int tun, int sock, int ctl, in_addr_t pub_ip, in_addr_t tun_ip, size_t tun_mtu, int log_errors) {
 	char *buf;
 	struct pollfd fds[PFD_CNT] = {
 		{
@@ -420,6 +561,7 @@ void run_proxy(int tun, int sock, int ctl, in_addr_t tun_ip, size_t tun_mtu, int
 
 	exit_flag = 0;
 	tun_addr = tun_ip;
+       pub_addr.sin_addr.s_addr = pub_ip;
 	log_enabled = log_errors;
 
 	buf = (char *) malloc(tun_mtu);

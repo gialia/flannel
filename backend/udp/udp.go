@@ -50,6 +50,7 @@ type UdpBackend struct {
 	conn   *net.UDPConn
 	mtu    int
 	tunNet ip.IP4Net
+        pubIP  ip.IP4
 	ctx    context.Context
 	cancel context.CancelFunc
 	wg     sync.WaitGroup
@@ -78,6 +79,9 @@ func (m *UdpBackend) Init(extIface *net.Interface, extIP net.IP) (*backend.Subne
 	}
 
 	// Acquire the lease form subnet manager
+       m.pubIP = ip.FromIP(extIP)
+       log.Infof("using %s IP address to acquire a lease from a subnet manager", m.pubIP.String());
+
 	attrs := subnet.LeaseAttrs{
 		PublicIP: ip.FromIP(extIP),
 	}
@@ -100,6 +104,9 @@ func (m *UdpBackend) Init(extIface *net.Interface, extIP net.IP) (*backend.Subne
 		IP:        l.Subnet.IP,
 		PrefixLen: m.config.Network.PrefixLen,
 	}
+
+       log.Infof("using %s/%d ip address for flannel tunnel network",
+                       l.Subnet.IP.String(), m.config.Network.PrefixLen);
 
 	// TUN MTU will be smaller b/c of encap (IP+UDP hdrs)
 	m.mtu = extIface.MTU - encapOverhead
@@ -129,7 +136,7 @@ func (m *UdpBackend) Run() {
 	m.wg.Add(2)
 
 	go func() {
-		runCProxy(m.tun, m.conn, m.ctl2, m.tunNet.IP, m.mtu)
+               runCProxy(m.tun, m.conn, m.ctl2, m.pubIP, m.tunNet.IP, m.mtu)
 		m.wg.Done()
 	}()
 
@@ -194,6 +201,8 @@ func configureIface(ifname string, ipn ip.IP4Net, mtu int) error {
 		return fmt.Errorf("failed to add IP address %v to %v: %v", ipn.String(), ifname, err)
 	}
 
+       log.Infof("added IP address %v to %v", ipn.String(), ifname)
+
 	err = netlink.LinkSetMTU(iface, mtu)
 	if err != nil {
 		return fmt.Errorf("failed to set MTU for %v: %v", ifname, err)
@@ -214,6 +223,8 @@ func configureIface(ifname string, ipn ip.IP4Net, mtu int) error {
 	if err != nil && err != syscall.EEXIST {
 		return fmt.Errorf("Failed to add route (%v -> %v): %v", ipn.Network().String(), ifname, err)
 	}
+
+       log.Infof("added IP route to %v via %v", ipn.Network().String(), ifname)
 
 	return nil
 }

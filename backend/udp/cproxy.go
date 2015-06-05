@@ -28,7 +28,7 @@ import (
 	"github.com/coreos/flannel/pkg/ip"
 )
 
-func runCProxy(tun *os.File, conn *net.UDPConn, ctl *os.File, tunIP ip.IP4, tunMTU int) {
+func runCProxy(tun *os.File, conn *net.UDPConn, ctl *os.File, pubIP ip.IP4, tunIP ip.IP4, tunMTU int) {
 	var log_errors int
 	if log.V(1) {
 		log_errors = 1
@@ -45,6 +45,7 @@ func runCProxy(tun *os.File, conn *net.UDPConn, ctl *os.File, tunIP ip.IP4, tunM
 		C.int(tun.Fd()),
 		C.int(c.Fd()),
 		C.int(ctl.Fd()),
+               C.in_addr_t(pubIP.NetworkOrder()),
 		C.in_addr_t(tunIP.NetworkOrder()),
 		C.size_t(tunMTU),
 		C.int(log_errors),

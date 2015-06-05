@@ -35,6 +35,6 @@ typedef struct command {
 	short     next_hop_port;
 } command;
 
-void run_proxy(int tun, int sock, int ctl, in_addr_t tun_ip, size_t tun_mtu, int log_errors);
+void run_proxy(int tun, int sock, int ctl, in_addr_t pub_ip, in_addr_t tun_ip, size_t tun_mtu, int log_errors);
 
 #endif

@@ -9,6 +9,16 @@
 #   PKG=ssh ./test
 #
 
+cd `dirname $0` || exit 1;
+
+if [ -z "${GOPATH+x}" ]; then
+       export GOPATH=${PWD}/gopath
+fi
+
+if [ -z "${GOBIN+x}" ]; then
+        export GOBIN=${PWD}/bin
+fi
+
 # Invoke ./cover for HTML output
 COVER=${COVER:-"-cover"}
 
